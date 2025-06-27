@@ -8,12 +8,11 @@ import (
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 	"gorm.io/plugin/optimisticlock"
 )
 
-type Product struct {
+type ProductOptimistic struct {
 	ID    uint `grom:"primaryKey"`
 	Name  string
 	Stock int64
@@ -33,7 +32,7 @@ func setupDB() *gorm.DB {
 		log.Fatal("Failed to connect database")
 	}
 
-	err = db.AutoMigrate(&Product{})
+	err = db.AutoMigrate(&ProductOptimistic{})
 	if err != nil {
 		log.Fatal("Failed run migration")
 	}
@@ -41,44 +40,48 @@ func setupDB() *gorm.DB {
 	return db
 }
 
-func processOrderPessimistic(db *gorm.DB, productID uint, quantity int64, wg *sync.WaitGroup, workerID int) {
+func processOrderOptimistic(db *gorm.DB, productID uint, quantity int64, wg *sync.WaitGroup, workerID int) {
 	defer wg.Done()
 
-	err := db.Transaction(func(tx *gorm.DB) error {
-		var product Product
+	for i := 0; i < 2; i++ {
+		var product ProductOptimistic
 
-		if err := tx.Clauses(clause.Locking{
-			Strength: "UPDATE",
-		}).First(&product, productID).Error; err != nil {
-			return err
+		if err := db.First(&product, productID).Error; err != nil {
+			log.Printf("Worker %d: Failed to find product: %v", workerID, err)
+			return
 		}
-
-		fmt.Printf("Acquired lock. Worker: %d, Current stock: %d\n", workerID, product.Stock)
-		time.Sleep(100 * time.Millisecond)
 
 		if product.Stock < quantity {
-			return fmt.Errorf("worker %d: not enough stock", workerID)
+			log.Printf("Worker %d: Not enough stock.", workerID)
+			return
 		}
 
-		product.Stock -= quantity
-		if err := tx.Save(&product).Error; err != nil {
-			return err
+		time.Sleep(100 * time.Millisecond)
+
+		result := db.Model(&product).Updates(ProductOptimistic{Stock: product.Stock - quantity})
+		if result.Error != nil {
+			log.Printf("Worker %d: Update failed: %v", workerID, result.Error)
+			continue
 		}
 
-		fmt.Printf("Worker %d: Oder processed. New stock: %d\n", workerID, product.Stock)
-		return nil
-	})
+		if result.RowsAffected == 0 {
+			log.Printf("Worker %d: Conflict detected (version mismatch). Retrying...", workerID)
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
 
-	if err != nil {
-		log.Printf("Transaction failed: %v, worker: %d", err, workerID)
+		fmt.Printf("Worker %d: Update successful! New stock: %d\n", workerID, product.Stock-quantity)
+		return
 	}
+
+	log.Printf("Worker %d: Failed to process order after multiple retries.", workerID)
 }
 
 func main() {
 	db := setupDB()
 
 	db.Exec("TRUNCATE TABLE products RESTART IDENTITY")
-	product := Product{Name: "Sugar", Stock: 10}
+	product := ProductOptimistic{Name: "Sugar", Stock: 10}
 	db.Create(&product)
 
 	fmt.Println("Running Optimistic Locking Example")
@@ -87,7 +90,7 @@ func main() {
 
 	for i := 1; i <= 20; i++ {
 		wg.Add(1)
-		go processOrderPessimistic(db, product.ID, 1, &wg, i)
+		go processOrderOptimistic(db, product.ID, 1, &wg, i)
 	}
 
 	wg.Wait()
